@@ -10,10 +10,11 @@ import torch
 from misc_functions import get_example_params, save_class_activation_images
 
 
-class CamExtractor():
+class CamExtractor:
     """
         Extracts cam features from the model
     """
+
     def __init__(self, model, target_layer):
         self.model = model
         self.target_layer = target_layer
@@ -50,6 +51,7 @@ class GradCam():
     """
         Produces class activation map
     """
+
     def __init__(self, model, target_layer):
         self.model = model
         self.model.eval()
@@ -86,7 +88,7 @@ class GradCam():
         cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam))  # Normalize between 0-1
         cam = np.uint8(cam * 255)  # Scale between 0-255 to visualize
         cam = np.uint8(Image.fromarray(cam).resize((input_image.shape[2],
-                       input_image.shape[3]), Image.ANTIALIAS))/255
+                                                    input_image.shape[3]), Image.ANTIALIAS)) / 255
         # ^ I am extremely unhappy with this line. Originally resizing was done in cv2 which
         # supports resizing numpy matrices with antialiasing, however,
         # when I moved the repository to PIL, this option was out of the window.
@@ -99,7 +101,7 @@ class GradCam():
 if __name__ == '__main__':
     # Get params
     target_example = 0  # Snake
-    (original_image, prep_img, target_class, file_name_to_export, pretrained_model) =\
+    (original_image, prep_img, target_class, file_name_to_export, pretrained_model) = \
         get_example_params(target_example)
     # Grad cam
     grad_cam = GradCam(pretrained_model, target_layer=11)

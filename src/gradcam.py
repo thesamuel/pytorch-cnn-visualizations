@@ -42,12 +42,13 @@ class CamExtractor:
         # Forward pass on the convolutions
         conv_output, x = self.forward_pass_on_convolutions(x)
         x = x.view(x.size(0), -1)  # Flatten
+
         # Forward pass on the classifier
         x = self.model.classifier(x)
         return conv_output, x
 
 
-class GradCam():
+class GradCam:
     """
         Produces class activation map
     """
@@ -55,6 +56,7 @@ class GradCam():
     def __init__(self, model, target_layer):
         self.model = model
         self.model.eval()
+
         # Define extractor
         self.extractor = CamExtractor(self.model, target_layer)
 
@@ -65,22 +67,30 @@ class GradCam():
         conv_output, model_output = self.extractor.forward_pass(input_image)
         if target_class is None:
             target_class = np.argmax(model_output.data.numpy())
+
         # Target for backprop
         one_hot_output = torch.FloatTensor(1, model_output.size()[-1]).zero_()
         one_hot_output[0][target_class] = 1
+
         # Zero grads
         self.model.features.zero_grad()
         self.model.classifier.zero_grad()
+
         # Backward pass with specified target
         model_output.backward(gradient=one_hot_output, retain_graph=True)
+
         # Get hooked gradients
         guided_gradients = self.extractor.gradients.data.numpy()[0]
+
         # Get convolution outputs
         target = conv_output.data.numpy()[0]
+
         # Get weights from gradients
         weights = np.mean(guided_gradients, axis=(1, 2))  # Take averages for each gradient
+
         # Create empty numpy array for cam
         cam = np.ones(target.shape[1:], dtype=np.float32)
+
         # Multiply each weight with its conv output and then, sum
         for i, w in enumerate(weights):
             cam += w * target[i, :, :]
@@ -95,6 +105,7 @@ class GradCam():
         # So, in order to use resizing with ANTIALIAS feature of PIL,
         # I briefly convert matrix to PIL image and then back.
         # If there is a more beautiful way, do not hesitate to send a PR.
+
         return cam
 
 
@@ -103,10 +114,14 @@ if __name__ == '__main__':
     target_example = 0  # Snake
     (original_image, prep_img, target_class, file_name_to_export, pretrained_model) = \
         get_example_params(target_example)
+
     # Grad cam
     grad_cam = GradCam(pretrained_model, target_layer=11)
+
     # Generate cam mask
     cam = grad_cam.generate_cam(prep_img, target_class)
+
     # Save mask
     save_class_activation_images(original_image, cam, file_name_to_export)
+
     print('Grad cam completed')

@@ -13,6 +13,7 @@ from misc_functions import get_example_params, save_class_activation_images
 def coolhook(m, i, o):
     print("BOOYA")
 
+
 class CamExtractor:
     """
         Extracts cam features from the model
@@ -21,6 +22,8 @@ class CamExtractor:
     def __init__(self, model, target_layer):
         self.model = model
         self.target_layer = target_layer
+
+        self.x = None
         self.gradients = None
         self.gradients_2 = None
 
@@ -28,9 +31,12 @@ class CamExtractor:
         print("SAVE_GRAD", type(self), self, grad)
         self.gradients = grad
 
+    def save_forward(self, module, input, output):
+        self.x = output
+
     def save_gradient_2(self, module, grad_input, grad_output):
         print("WHOOPSIE_DOODLE", type(self), self, grad_input, grad_output)
-        self.gradients_2 = grad_output
+        self.gradients_2 = grad_output[0]
 
     def forward_pass_on_convolutions(self, x):
         """
@@ -40,7 +46,7 @@ class CamExtractor:
         for module_pos, module in self.model.features._modules.items():
             # TODO: use register_backward_hook
             if int(module_pos) == self.target_layer:
-                module.register_forward_hook(coolhook)
+                module.register_forward_hook(self.save_forward)
                 module.register_backward_hook(self.save_gradient_2)
 
             x = module(x)  # Forward
@@ -74,7 +80,39 @@ class GradCam:
         # Define extractor
         self.extractor = CamExtractor(self.model, target_layer)
 
-    def cam(self, guided_gradients, target, input_image):
+    def generate_cam(self, input_image, target_class=None):
+        # Full forward pass
+        # conv_output is the output of convolutions at specified layer
+        # model_output is the final output of the model (1, 1000)
+        conv_output, model_output = self.extractor.forward_pass(input_image)
+        if target_class is None:
+            target_class = np.argmax(model_output.data.numpy())
+
+        assert conv_output == self.extractor.x
+
+        # Target for backprop
+        one_hot_output = torch.FloatTensor(1, model_output.size()[-1]).zero_()
+        one_hot_output[0][target_class] = 1
+
+        # Zero grads
+        self.model.features.zero_grad()
+        self.model.classifier.zero_grad()
+
+        # Backward pass with specified target
+        model_output.backward(gradient=one_hot_output, retain_graph=True)
+
+        # Get hooked gradients
+        guided_gradients = self.extractor.gradients.data.numpy()[0]
+
+        assert self.extractor.gradients == self.extractor.gradients_2
+
+        # Get convolution outputs
+        target = conv_output.data.numpy()[0]
+
+        return self.cam_helper(guided_gradients, target, input_image)
+
+    @staticmethod
+    def cam_helper(guided_gradients, target, input_image):
         # Get weights from gradients
         weights = np.mean(guided_gradients, axis=(1, 2))  # Take averages for each gradient
 
@@ -99,37 +137,6 @@ class GradCam:
         cam = np.uint8(cam) / 255
 
         return cam
-
-    def generate_cam(self, input_image, target_class=None):
-        # Full forward pass
-        # conv_output is the output of convolutions at specified layer
-        # model_output is the final output of the model (1, 1000)
-        conv_output, model_output = self.extractor.forward_pass(input_image)
-        if target_class is None:
-            target_class = np.argmax(model_output.data.numpy())
-
-        # Target for backprop
-        one_hot_output = torch.FloatTensor(1, model_output.size()[-1]).zero_()
-        one_hot_output[0][target_class] = 1
-
-        # TODO: fix this
-        # one_hot_output = torch.zeros((1, model_output.size()[-1])).scatter_(1, target_class, 1)
-
-        # Zero grads
-        self.model.features.zero_grad()
-        self.model.classifier.zero_grad()
-
-        # Backward pass with specified target
-        model_output.backward(gradient=one_hot_output, retain_graph=True)
-
-        # Get hooked gradients
-        assert self.extractor.gradients == self.extractor.gradients_2
-        guided_gradients = self.extractor.gradients.data.numpy()[0]
-
-        # Get convolution outputs
-        target = conv_output.data.numpy()[0]
-
-        return cam(guided_gradients, target, input_image)
 
 
 if __name__ == '__main__':

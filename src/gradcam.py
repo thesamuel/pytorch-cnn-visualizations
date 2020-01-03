@@ -1,157 +1,121 @@
-"""
-Created on Thu Oct 26 11:06:51 2017
+from typing import List, Optional
 
-@author: Utku Ozbulak - github.com/utkuozbulak
-"""
-from PIL import Image
-import numpy as np
 import torch
 
-from misc_functions import get_example_params, save_class_activation_images
+from torch import nn
+from torch.nn import functional as F
+
+import matplotlib.cm as cm
+import numpy as np
+
+_TOP_K = 3
 
 
-def coolhook(m, i, o):
-    print("BOOYA")
+def _composite_image(gcam, raw_image):
+    gcam = gcam.cpu().numpy()
+    cmap = cm.jet_r(gcam)[..., :3] * 255.0
+    gcam = (cmap.astype(np.float) + raw_image.astype(np.float)) / 2
+    gcam = np.uint8(gcam)
+    return gcam
 
 
-class CamExtractor:
-    """
-        Extracts cam features from the model
-    """
+def _generate(fmaps, grads, image_shape):
+    # Compute grad weights
+    weights = F.adaptive_avg_pool2d(grads, 1)
 
-    def __init__(self, model, target_layer):
-        self.model = model
-        self.target_layer = target_layer
+    gcam = torch.mul(fmaps, weights).sum(dim=1, keepdim=True)
+    gcam = F.relu(gcam)
 
-        self.x = None
-        self.gradients = None
-        self.gradients_2 = None
+    gcam = F.interpolate(
+        gcam, image_shape, mode="bilinear", align_corners=False
+    )
 
-    def save_gradient(self, grad):
-        print("SAVE_GRAD", type(self), self, grad)
-        self.gradients = grad
+    B, C, H, W = gcam.shape
+    gcam = gcam.view(B, -1)
+    gcam -= gcam.min(dim=1, keepdim=True)[0]
+    gcam /= gcam.max(dim=1, keepdim=True)[0]
+    gcam = gcam.view(B, C, H, W)
 
-    def save_forward(self, module, input, output):
-        self.x = output
+    return gcam
 
-    def save_gradient_2(self, module, grad_input, grad_output):
-        print("WHOOPSIE_DOODLE", type(self), self, grad_input, grad_output)
-        self.gradients_2 = grad_output[0]
 
-    def forward_pass_on_convolutions(self, x):
-        """
-            Does a forward pass on convolutions, hooks the function at given layer
-        """
+class GradCAM(nn.Module):
+
+    def _forward_helper(self, image):
+        # Setup forward hook
         conv_output = None
-        for module_pos, module in self.model.features._modules.items():
-            # TODO: use register_backward_hook
-            if int(module_pos) == self.target_layer:
-                module.register_forward_hook(self.save_forward)
-                module.register_backward_hook(self.save_gradient_2)
 
-            x = module(x)  # Forward
-            if int(module_pos) == self.target_layer:
-                x.register_hook(self.save_gradient)
-                conv_output = x  # Save the convolution output on that layer
-        return conv_output, x
+        def save_layer_output(module: nn.Module, layer_input: torch.Tensor, layer_output: torch.Tensor):
+            nonlocal conv_output
+            conv_output = layer_output.detach()
 
-    def forward_pass(self, x):
-        """
-            Does a full forward pass on the model
-        """
-        # Forward pass on the convolutions
-        conv_output, x = self.forward_pass_on_convolutions(x)
-        x = x.view(x.size(0), -1)  # Flatten
+        forward_handle = self.grad_cam_layer().register_forward_hook(save_layer_output)
 
-        # Forward pass on the classifier
-        x = self.model.classifier(x)
-        return conv_output, x
+        # Forward pass
+        self.zero_grad()
+        model_output = self.forward(image)
 
+        forward_handle.remove()
 
-class GradCam:
-    """
-        Produces class activation map
-    """
+        return model_output, conv_output
 
-    def __init__(self, model, target_layer):
-        self.model = model
-        self.model.eval()
+    def save_gradient(self, module, grad_input, grad_output):
+        print("Backward hook triggered")
+        self.foo = grad_output[0].detach()
 
-        # Define extractor
-        self.extractor = CamExtractor(self.model, target_layer)
+    def _backward_helper(self, model_output: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+        # Setup backward hook
+        guided_gradients = None
 
-    def generate_cam(self, input_image, target_class=None):
-        # Full forward pass
-        # conv_output is the output of convolutions at specified layer
-        # model_output is the final output of the model (1, 1000)
-        conv_output, model_output = self.extractor.forward_pass(input_image)
-        if target_class is None:
-            target_class = np.argmax(model_output.data.numpy())
+        # def save_gradient(module, grad_input, grad_output):
+        #     print("Backward hook triggered")
+        #     nonlocal guided_gradients
+        #     guided_gradients = grad_output[0].detach()
 
-        assert conv_output == self.extractor.x
+        backward_handle = self.grad_cam_layer().register_backward_hook(self.save_gradient)
 
-        # Target for backprop
-        one_hot_output = torch.FloatTensor(1, model_output.size()[-1]).zero_()
-        one_hot_output[0][target_class] = 1
+        one_hot = model_output.new_zeros(model_output.size())
+        one_hot.scatter_(1, ids, 1.0)
 
-        # Zero grads
-        self.model.features.zero_grad()
-        self.model.classifier.zero_grad()
+        model_output.backward(gradient=one_hot, retain_graph=True)
 
-        # Backward pass with specified target
-        model_output.backward(gradient=one_hot_output, retain_graph=True)
+        # if guided_gradients is None:
+        #     raise RuntimeError("Backward hook gave no gradients. See PyTorch issues related to register_backward_hook.")
 
-        # Get hooked gradients
-        guided_gradients = self.extractor.gradients.data.numpy()[0]
+        backward_handle.remove()
 
-        assert self.extractor.gradients == self.extractor.gradients_2
+        return guided_gradients
 
-        # Get convolution outputs
-        target = conv_output.data.numpy()[0]
+    # TODO: rename image to images
+    def generate_grad_cam(self,
+                          images: torch.Tensor,
+                          raw_images: list,
+                          target_classes: Optional[torch.LongTensor] = None) -> List[List[np.array]]:
+        self.eval()
+        model_output, conv_output = self._forward_helper(images)
 
-        return self.cam_helper(guided_gradients, target, input_image)
+        if not target_classes:
+            probs = F.softmax(model_output, dim=1)
+            # TODO: use topk function
+            top_probs, top_ids = probs.sort(dim=1, descending=True)
+            target_classes = top_ids[:, :_TOP_K]
 
-    @staticmethod
-    def cam_helper(guided_gradients, target, input_image):
-        # Get weights from gradients
-        weights = np.mean(guided_gradients, axis=(1, 2))  # Take averages for each gradient
+        results = [[]] * len(images)  # List with one empty list for each input image
+        for target_class in target_classes.T:
+            # Perform one backward operation for each target class and capture gradients
+            guided_gradients = self._backward_helper(
+                model_output,
+                target_class.unsqueeze(dim=1)
+            )
 
-        # Create empty numpy array for cam
-        cam = np.ones(target.shape[1:], dtype=np.float32)
+            image_shape = images.shape[2:]
+            regions = _generate(conv_output, guided_gradients, image_shape)
 
-        # Multiply each weight with its conv output and then, sum
-        for i, w in enumerate(weights):
-            cam += w * target[i, :, :]
-        cam = np.maximum(cam, 0)
-        cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam))  # Normalize between 0-1
-        cam = np.uint8(cam * 255)  # Scale between 0-255 to visualize
+            for i, region, raw_image in enumerate(zip(regions, raw_images)):
+                result = _composite_image(region, raw_image)
+                results[i].append(result)
 
-        # I am extremely unhappy with this line. Originally resizing was done in cv2 which
-        # supports resizing numpy matrices with antialiasing, however,
-        # when I moved the repository to PIL, this option was out of the window.
-        # So, in order to use resizing with ANTIALIAS feature of PIL,
-        # I briefly convert matrix to PIL image and then back.
-        # If there is a more beautiful way, do not hesitate to send a PR.
-        cam = Image.fromarray(cam).resize((input_image.shape[2], input_image.shape[3]), Image.ANTIALIAS)
+        return results
 
-        cam = np.uint8(cam) / 255
-
-        return cam
-
-
-if __name__ == '__main__':
-    # Get params
-    target_example = 0  # Snake
-    (original_image, prep_img, target_class, file_name_to_export, pretrained_model) = \
-        get_example_params(target_example)
-
-    # Grad cam
-    grad_cam = GradCam(pretrained_model, target_layer=11)
-
-    # Generate cam mask
-    cam = grad_cam.generate_cam(prep_img, target_class)
-
-    # Save mask
-    save_class_activation_images(original_image, cam, file_name_to_export)
-
-    print('Grad cam completed')
+    def grad_cam_layer(self) -> nn.Module:
+        raise NotImplementedError("Return a layer in your model to target for Grad CAM.")
